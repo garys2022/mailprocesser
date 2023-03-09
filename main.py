@@ -66,7 +66,7 @@ def main():
         verify_label(service, parent_label)
         results = service.users().messages().list(userId='me',
                                                   labelIds=parent_label.to_process.id,
-                                                  maxResults=100).execute()
+                                                  maxResults=500).execute()
         messages = results.get('messages', [])
         # get sql engine ready
         engine = create_engine(database_url, pool_recycle=3600)
@@ -74,13 +74,23 @@ def main():
         if not messages:
             print('No labels found.')
             return
+        message_count = 0
         for message in messages:
+            message_count += 1
+            print(message_count)
+            # clean variable for each run
+            for var in ['sender','sender_name','sender_email','subject','role','href','company','mail_id','date']:
+                if var in locals():
+                    locals()[var] = None
+
             msg = service.users().messages().get(userId='me', id=message['id']).execute()
 
             mail_id = message['id']
             # task 1/5 - date
             # Convert internaldate to seconds
             date = datetime.datetime.fromtimestamp(int(msg['internalDate']) / 1000).date()
+
+
 
             # task 2/5 - date, sender
             # extract sender name and sender email information
@@ -99,44 +109,72 @@ def main():
 
             # task 5/5 date,role,href,company,sender
             # Extract job name , href , company name from ail
+
             for p in msg["payload"]["parts"]:
                 if p["mimeType"] == "text/html":
-                    data = base64.urlsafe_b64decode(p["body"]["data"]).decode("utf-8")
-                    role, href, company = extract_data(data, sender_email, subject)
+                    if sender_email.find('linkedin.com') != -1 & subject.find('your application was sent to') != -1:
+                        data = base64.urlsafe_b64decode(p["body"]["data"]).decode("utf-8")
+                        role, href, company = extract_data_Linkedin(data)
 
-            # TODO - outcome should include date , role name , href , company , job website
-            record = Job_application(**{
-                'id': mail_id,
-                'date': date,
-                'role': role,
-                'href': href,
-                'company': company,
-                'via_name': sender_name,
-                'via_email': sender_email
-            })
+                    elif (sender_email.find('indeedapply@indeed.com') != -1) & \
+                            (subject.find('Indeed Application') != -1):
+                        data = base64.urlsafe_b64decode(p["body"]["data"]).decode("utf-8")
+                        role, href, company = extract_data_indeed(data)
 
-            with Session(engine) as session:
-                try:
-                    session.add(record)
-                    # Modify the message to move it to the Trash folder
-                    modified = False
-                    modify_request = {'addLabelIds': [parent_label.processed.id], 'removeLabelIds': msg['labelIds']}
-                    service.users().messages().modify(userId='me', id=mail_id, body=modify_request).execute()
-                    modified = True
-                    session.commit()
+                if p["mimeType"] == "multipart/alternative":
+                    if sender_email.find('@email.reed.co.uk') != -1 & subject.find(
+                    "We've sent your application to the recruiter") != -1:
+                        for pp in p['parts']:
+                            if pp["mimeType"]== "text/html":
+                                data = base64.urlsafe_b64decode(pp["body"]["data"]).decode("utf-8")
+                                role,href,company = extract_data_reeds(data)
 
-                except Exception as e:
-                    print('error occur , rollback.')
-                    print(e)
-                    session.rollback()
+            try:
+                record = Job_application(**{
+                    'id': mail_id,
+                    'date': date,
+                    'role': role,
+                    'href': href,
+                    'company': company,
+                    'via_name': sender_name,
+                    'via_email': sender_email
+                })
+
+                with Session(engine) as session:
+                    try:
+                        session.add(record)
+                        # Modify the message to move it to the Trash folder
+                        modified = False
+                        modify_request = {'addLabelIds': [parent_label.processed.id], 'removeLabelIds': msg['labelIds']}
+                        service.users().messages().modify(userId='me', id=mail_id, body=modify_request).execute()
+                        modified = True
+                        session.commit()
+
+                    except Exception as e:
+                        print('error occur , rollback.')
+                        print(e)
+                        session.rollback()
+                        if modified:
+                            modify_request = {'addLabelIds': [parent_label.error.id],
+                                              'removeLabelIds': [parent_label.processed.id]}
+                            service.users().messages().modify(userId='me', id=mail_id, body=modify_request).execute()
+                        else:
+                            modify_request = {'addLabelIds': [parent_label.error.id],
+                                              'removeLabelIds': msg['labelIds']}
+                            service.users().messages().modify(userId='me', id=mail_id, body=modify_request).execute()
+            except UnboundLocalError as t:
+                print(f'mail process failure for mail {subject} , mail moved to error tag')
+                print(t)
+
+                if 'modified' in locals():
                     if modified:
                         modify_request = {'addLabelIds': [parent_label.error.id],
-                                          'removeLabelIds': [parent_label.processed.id]}
+                                              'removeLabelIds': [parent_label.processed.id]}
                         service.users().messages().modify(userId='me', id=mail_id, body=modify_request).execute()
-                    else:
-                        modify_request = {'addLabelIds': [parent_label.error.id],
+                else:
+                    modify_request = {'addLabelIds': [parent_label.error.id],
                                           'removeLabelIds': msg['labelIds']}
-                        service.users().messages().modify(userId='me', id=mail_id, body=modify_request).execute()
+                    service.users().messages().modify(userId='me', id=mail_id, body=modify_request).execute()
 
 
 
@@ -161,6 +199,12 @@ def extract_data(html: str, via_mail: str, subject: str):
     if via_mail.find('linkedin.com') != -1 & subject.find('your application was sent to') != -1:
         name, href, company = extract_data_Linkedin(html)
         return name, href, company
+    # case for reed
+    elif via_mail.find('@email.reed.co.uk') != -1 & subject.find("We've sent your application to the recruiter") != -1:
+        name, href, company = extract_data_reeds(html)
+        return name, href, company
+    else :
+        return None
 
 
 def extract_data_Linkedin(html: str):
@@ -169,7 +213,6 @@ def extract_data_Linkedin(html: str):
     application confirmation email.
 
     :param html: Html of LinkedIn application confirmation email in str format
-    :param via: source of job board
     :return:    name:str  job role name applied
                 href:str LinkedIn hyperlink to the job role
                 company:str  Job poster
@@ -187,6 +230,32 @@ def extract_data_Linkedin(html: str):
 
     return name, href, company
 
+def extract_data_reeds(html:str):
+    soup = BeautifulSoup(html, 'html.parser')
+    a_tags = soup.find_all('a')
+
+    name = a_tags[1].text
+    href = a_tags[1].attrs['href']
+
+    count_a = 0
+    td_tags = soup.find_all('td')
+    for td_tag in td_tags:
+        if td_tag.find('td') is None:
+            count_a += 1
+            if count_a == 6:
+                company = td_tag.text
+
+    return name,href,company
+
+def extract_data_indeed(html: str):
+    soup = BeautifulSoup(html, 'html.parser')
+    a_tags = soup.find_all('a')
+
+    name = a_tags[1].text.strip()
+    href = a_tags[1].attrs['href']
+    company = a_tags[2].text
+
+    return name, href, company
 
 def verify_label(service, parent_label):
     """
